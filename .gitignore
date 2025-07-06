@@ -231,6 +231,9 @@ __pycache__/
 *.rar
 *.7z
 
+# Data files
+data/
+
 # Database files
 *.db
 *.sqlite
