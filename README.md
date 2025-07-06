@@ -68,10 +68,6 @@ Intelligent-Complaint-Analysis/
    export OPENAI_API_KEY="your-api-key-here"
    ```
 
-4. **Download CFPB data**
-   - Download from: https://www.consumerfinance.gov/data-research/consumer-complaints/
-   - Place in `data/cfpb_complaints.csv`
-
 ## 📊 Usage
 
 ### Task 1: EDA and Preprocessing
@@ -100,11 +96,6 @@ python src/app.py
 
 ## 🔧 Configuration
 
-### Environment Variables
-- `OPENAI_API_KEY`: Your OpenAI API key
-- `OPENAI_MODEL`: Language model (default: gpt-3.5-turbo)
-- `EMBEDDING_MODEL`: Embedding model (default: text-embedding-ada-002)
-
 ### Parameters
 - **Chunk Size**: 1000 characters (configurable in `chunking_embedding.py`)
 - **Chunk Overlap**: 200 characters
@@ -130,36 +121,3 @@ pytest tests/
 - **Interim Report**: `docs/interim_report.md` (Tasks 1-2)
 - **Final Report**: `docs/final_report.md` (Complete project)
 - **References**: `docs/references.md` (Resources and links)
-
-## 🤝 Contributing
-
-1. Fork the repository
-2. Create a feature branch
-3. Make your changes
-4. Add tests
-5. Submit a pull request
-
-## 📄 License
-
-This project is licensed under the MIT License - see the LICENSE file for details.
-
-## 🙏 Acknowledgments
-
-- Consumer Financial Protection Bureau for the dataset
-- OpenAI for language models and embeddings
-- LangChain for the RAG framework
-- FAISS for vector similarity search
-- Gradio for the web interface
-
-## 📞 Support
-
-For questions or issues:
-- Create an issue on GitHub
-- Check the documentation in `docs/`
-- Review the Jupyter notebooks for examples
-
----
-
-**Project Status**: Active Development  
-**Last Updated**: July 2025  
-**Version**: 1.0.0 
