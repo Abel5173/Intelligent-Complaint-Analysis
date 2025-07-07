@@ -54,7 +54,7 @@ Intelligent-Complaint-Analysis/
 
 1. **Clone the repository**
    ```bash
-   git clone [<repository-url>](https://github.com/Abel5173/Intelligent-Complaint-Analysis.git)
+   git clone https://github.com/Abel5173/Intelligent-Complaint-Analysis.git
    cd Intelligent-Complaint-Analysis
    ```
 
