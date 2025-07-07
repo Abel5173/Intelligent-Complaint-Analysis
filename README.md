@@ -54,18 +54,13 @@ Intelligent-Complaint-Analysis/
 
 1. **Clone the repository**
    ```bash
-   git clone <repository-url>
+   git clone [<repository-url>](https://github.com/Abel5173/Intelligent-Complaint-Analysis.git)
    cd Intelligent-Complaint-Analysis
    ```
 
 2. **Install dependencies**
    ```bash
    pip install -r requirements.txt
-   ```
-
-3. **Set up environment variables**
-   ```bash
-   export OPENAI_API_KEY="your-api-key-here"
    ```
 
 ## 📊 Usage
@@ -90,7 +85,7 @@ python src/rag_pipeline.py
 
 ### Task 4: Web Application
 ```bash
-# Launch the Gradio app
+# Launch the streamlit
 python src/app.py
 ```
 
@@ -115,9 +110,3 @@ Run the test suite:
 ```bash
 pytest tests/
 ```
-
-## 📝 Reports
-
-- **Interim Report**: `docs/interim_report.md` (Tasks 1-2)
-- **Final Report**: `docs/final_report.md` (Complete project)
-- **References**: `docs/references.md` (Resources and links)
