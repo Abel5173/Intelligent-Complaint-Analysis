@@ -1,290 +1,171 @@
-#!/usr/bin/env python3
-"""
-Task 4: Gradio/Streamlit App for Intelligent Complaint Analysis
-
-This script creates a web application for the complaint analysis system.
-"""
-
-import gradio as gr
+import logging
+import re
 import pandas as pd
-import numpy as np
-import plotly.express as px
-import plotly.graph_objects as go
-from typing import List, Dict, Any
-import os
-import sys
+from rag_pipeline import rag_pipeline
+import streamlit as st
 
-# Add src to path to import our modules
-sys.path.append(os.path.join(os.path.dirname(__file__), '..'))
+# Set up logging
+logging.basicConfig(level=logging.INFO,
+                    format='%(asctime)s - %(levelname)s - %(message)s')
+logger = logging.getLogger(__name__)
 
-from src.rag_pipeline import ComplaintRAGPipeline
 
-class ComplaintAnalysisApp:
-    """Gradio app for complaint analysis."""
-    
-    def __init__(self):
-        self.rag_pipeline = None
-        self.complaints_data = None
-        self._load_data()
-    
-    def _load_data(self):
-        """Load complaints data and initialize RAG pipeline."""
+def clean_groq_response(response: str) -> str:
+    """
+    Clean the Groq LLM output by removing internal reasoning, think tags,
+    and verbose chunk listings, ensuring a concise, user-friendly answer.
+    """
+    # Remove <think> tags and reasoning steps
+    cleaned = re.sub(r'<think>.*?</think>|<think>.*?(?=\n\n|$)',
+                     '', response, flags=re.DOTALL)
+    # Remove verbose chunk listings (e.g., "First, the complaint from...")
+    cleaned = re.sub(
+        r'(First|Next|Then|The \w+ entry).*?(?=\n\n|$)', '', cleaned, flags=re.DOTALL)
+    # Remove trailing ellipses or incomplete sentences
+    cleaned = re.sub(r'\.\.\.+$|[^\.\!\?]+$', '', cleaned.strip())
+    return cleaned.strip() or response.strip()
+
+
+# Custom CSS for improved UI
+st.markdown("""
+    <style>
+    .main { background-color: #f5f5f5; }
+    .stTextInput > div > div > input { border-radius: 5px; padding: 10px; }
+    .stButton > button { border-radius: 5px; padding: 8px 16px; }
+    .stExpander { background-color: #ffffff; border: 1px solid #e0e0e0; border-radius: 5px; }
+    .stDataFrame { margin-top: 10px; }
+    .sidebar .sidebar-content { background-color: #f0f2f6; }
+    .stTabs { margin-top: 20px; }
+    </style>
+""", unsafe_allow_html=True)
+
+# Streamlit app
+st.set_page_config(page_title="CreditTrust Complaint Analysis", layout="wide")
+st.title("💡 CreditTrust Complaint Analysis")
+st.markdown("Ask questions about customer complaints in the financial domain. Answers are generated using complaint excerpts and metadata from CFPB data, with sources displayed for transparency.")
+
+# Sidebar with instructions and example questions
+with st.sidebar:
+    st.header("How to Use")
+    st.markdown("""
+        - Enter a question in the 'Query' tab (e.g., "What issues arise with Money transfers?").
+        - Click **Submit** to get a streamed answer and view source complaint chunks.
+        - Use the **Clear** button to reset the conversation.
+        - Select a source chunk from the dropdown or view the metadata table.
+        - Check the 'History' tab to review past questions and answers.
+        **Example Questions**:
+        - Why are people unhappy with BNPL?
+        - What are common Credit card issues?
+        - Are there complaints from older consumers?
+        - What issues arise with Money transfers?
+    """)
+
+# Initialize session state for conversation history
+if 'conversation' not in st.session_state:
+    st.session_state.conversation = []
+if 'current_answer' not in st.session_state:
+    st.session_state.current_answer = ""
+if 'current_chunks' not in st.session_state:
+    st.session_state.current_chunks = []
+
+# Check vector store status
+try:
+    from rag_pipeline import vectorstore
+    doc_count = vectorstore._collection.count() if vectorstore else 0
+    if not vectorstore:
+        st.warning("The vector store is missing. Please run `src/chunking_embedding.py` to create and populate `complaints_collection` with data from `data/filtered_complaints.csv`.")
+    elif doc_count == 0:
+        st.warning("The vector store is empty. Please run `src/chunking_embedding.py` to populate it with data from `data/filtered_complaints.csv`.")
+except Exception as e:
+    st.warning(
+        f"Error accessing vector store: {e}. Please run `src/chunking_embedding.py` to create and populate `complaints_collection`.")
+
+# Create tabs for Query and History
+query_tab, history_tab = st.tabs(["Query", "History"])
+
+# Query tab
+with query_tab:
+    # Input form
+    with st.form(key="query_form"):
+        question = st.text_input(
+            label="Enter your question about customer complaints",
+            placeholder="e.g., What issues arise with Money transfers?"
+        )
+        # Adjust column widths to push Clear to the right
+        col1, col2, col3 = st.columns([3, 3, 1])
+        with col1:
+            submit_button = st.form_submit_button("Submit")
+        with col3:
+            clear_button = st.form_submit_button("Clear")
+
+    # Handle submit
+    if submit_button and question:
         try:
-            # Load filtered complaints data
-            self.complaints_data = pd.read_csv("../data/filtered_complaints.csv")
-            
-            # Initialize RAG pipeline
-            self.rag_pipeline = ComplaintRAGPipeline()
-            
+            with st.spinner("🔍 Generating answer..."):
+                result = rag_pipeline(question, k=5, stream=True)
+                st.session_state.current_answer = ""
+                answer_container = st.empty()
+                with answer_container:
+                    st.markdown("### 📝 Answer")
+                    for token in result["answer"]:
+                        st.session_state.current_answer += token
+                        st.markdown(clean_groq_response(
+                            st.session_state.current_answer))
+                st.session_state.current_chunks = result["retrieved_chunks"]
+                st.session_state.conversation.append(
+                    (question, clean_groq_response(st.session_state.current_answer)))
         except Exception as e:
-            print(f"Error loading data: {e}")
-            self.complaints_data = pd.DataFrame()
-    
-    def analyze_complaint(self, question: str) -> str:
-        """Analyze a complaint-related question using RAG."""
-        if not self.rag_pipeline:
-            return "Error: RAG pipeline not initialized. Please check the vector store."
-        
-        try:
-            result = self.rag_pipeline.query(question)
-            return result["answer"]
-        except Exception as e:
-            return f"Error analyzing complaint: {e}"
-    
-    def get_product_distribution(self) -> go.Figure:
-        """Create product distribution visualization."""
-        if self.complaints_data.empty:
-            return go.Figure()
-        
-        product_counts = self.complaints_data['Product'].value_counts().head(10)
-        
-        fig = go.Figure(data=[
-            go.Bar(
-                x=product_counts.values,
-                y=product_counts.index,
-                orientation='h',
-                marker_color='lightblue'
-            )
-        ])
-        
-        fig.update_layout(
-            title="Top 10 Product Categories by Complaint Count",
-            xaxis_title="Number of Complaints",
-            yaxis_title="Product Category",
-            height=500
-        )
-        
-        return fig
-    
-    def get_issue_distribution(self) -> go.Figure:
-        """Create issue distribution visualization."""
-        if self.complaints_data.empty:
-            return go.Figure()
-        
-        issue_counts = self.complaints_data['Issue'].value_counts().head(10)
-        
-        fig = go.Figure(data=[
-            go.Bar(
-                x=issue_counts.values,
-                y=issue_counts.index,
-                orientation='h',
-                marker_color='lightcoral'
-            )
-        ])
-        
-        fig.update_layout(
-            title="Top 10 Issue Types by Complaint Count",
-            xaxis_title="Number of Complaints",
-            yaxis_title="Issue Type",
-            height=500
-        )
-        
-        return fig
-    
-    def get_timeline_analysis(self) -> go.Figure:
-        """Create timeline analysis visualization."""
-        if self.complaints_data.empty:
-            return go.Figure()
-        
-        # Convert date column and group by month
-        self.complaints_data['Date received'] = pd.to_datetime(self.complaints_data['Date received'])
-        monthly_counts = self.complaints_data.groupby(
-            self.complaints_data['Date received'].dt.to_period('M')
-        ).size()
-        
-        fig = go.Figure(data=[
-            go.Scatter(
-                x=monthly_counts.index.astype(str),
-                y=monthly_counts.values,
-                mode='lines+markers',
-                line=dict(color='green', width=2),
-                marker=dict(size=6)
-            )
-        ])
-        
-        fig.update_layout(
-            title="Complaint Volume Over Time",
-            xaxis_title="Month",
-            yaxis_title="Number of Complaints",
-            height=400
-        )
-        
-        return fig
-    
-    def get_company_analysis(self) -> go.Figure:
-        """Create company analysis visualization."""
-        if self.complaints_data.empty:
-            return go.Figure()
-        
-        company_counts = self.complaints_data['Company'].value_counts().head(15)
-        
-        fig = go.Figure(data=[
-            go.Bar(
-                x=company_counts.values,
-                y=company_counts.index,
-                orientation='h',
-                marker_color='lightgreen'
-            )
-        ])
-        
-        fig.update_layout(
-            title="Top 15 Companies by Complaint Count",
-            xaxis_title="Number of Complaints",
-            yaxis_title="Company",
-            height=600
-        )
-        
-        return fig
+            st.error(f"Error processing question: {e}")
+            st.session_state.current_answer = f"Error: {e}"
+            st.session_state.current_chunks = []
 
-def create_app():
-    """Create and return the Gradio app interface."""
-    
-    app_instance = ComplaintAnalysisApp()
-    
-    with gr.Blocks(
-        title="Intelligent Complaint Analysis System",
-        theme=gr.themes.Soft()
-    ) as app:
-        
-        gr.Markdown("""
-        # 🏦 Intelligent Complaint Analysis System
-        
-        This application provides intelligent analysis of consumer financial complaints using advanced AI techniques.
-        """)
-        
-        with gr.Tabs():
-            
-            # Tab 1: RAG Analysis
-            with gr.TabItem("🤖 AI Analysis"):
-                gr.Markdown("""
-                ### Ask questions about consumer complaints
-                
-                Use natural language to ask questions about financial complaints, product issues, 
-                company responses, and more. The AI will analyze the complaint database and provide 
-                intelligent insights.
-                """)
-                
-                with gr.Row():
-                    with gr.Column(scale=2):
-                        question_input = gr.Textbox(
-                            label="Ask a question about complaints",
-                            placeholder="e.g., What are the most common credit card issues?",
-                            lines=3
-                        )
-                        analyze_btn = gr.Button("🔍 Analyze", variant="primary")
-                    
-                    with gr.Column(scale=3):
-                        answer_output = gr.Textbox(
-                            label="AI Analysis",
-                            lines=8,
-                            interactive=False
-                        )
-                
-                analyze_btn.click(
-                    fn=app_instance.analyze_complaint,
-                    inputs=question_input,
-                    outputs=answer_output
-                )
-            
-            # Tab 2: Data Visualizations
-            with gr.TabItem("📊 Data Insights"):
-                gr.Markdown("""
-                ### Explore complaint data through interactive visualizations
-                
-                Analyze patterns, trends, and distributions in the complaint dataset.
-                """)
-                
-                with gr.Row():
-                    with gr.Column():
-                        product_plot = gr.Plot(label="Product Distribution")
-                        issue_plot = gr.Plot(label="Issue Distribution")
-                    
-                    with gr.Column():
-                        timeline_plot = gr.Plot(label="Timeline Analysis")
-                        company_plot = gr.Plot(label="Company Analysis")
-                
-                # Load visualizations
-                product_plot.value = app_instance.get_product_distribution()
-                issue_plot.value = app_instance.get_issue_distribution()
-                timeline_plot.value = app_instance.get_timeline_analysis()
-                company_plot.value = app_instance.get_company_analysis()
-            
-            # Tab 3: Quick Stats
-            with gr.TabItem("📈 Quick Statistics"):
-                gr.Markdown("""
-                ### Key statistics about the complaint dataset
-                """)
-                
-                if not app_instance.complaints_data.empty:
-                    total_complaints = len(app_instance.complaints_data)
-                    unique_products = app_instance.complaints_data['Product'].nunique()
-                    unique_companies = app_instance.complaints_data['Company'].nunique()
-                    date_range = f"{app_instance.complaints_data['Date received'].min()} to {app_instance.complaints_data['Date received'].max()}"
-                    
-                    gr.Markdown(f"""
-                    - **Total Complaints**: {total_complaints:,}
-                    - **Unique Products**: {unique_products}
-                    - **Unique Companies**: {unique_companies}
-                    - **Date Range**: {date_range}
-                    """)
-                else:
-                    gr.Markdown("No data available. Please check the data files.")
-            
-            # Tab 4: About
-            with gr.TabItem("ℹ️ About"):
-                gr.Markdown("""
-                ## About This System
-                
-                This Intelligent Complaint Analysis System uses advanced AI techniques including:
-                
-                - **Retrieval-Augmented Generation (RAG)**: Combines information retrieval with text generation
-                - **Vector Embeddings**: Converts text into numerical representations for similarity search
-                - **Natural Language Processing**: Understands and responds to questions in natural language
-                
-                ### How it works:
-                1. **Data Processing**: Raw complaints are cleaned and preprocessed
-                2. **Text Chunking**: Long complaint narratives are split into manageable chunks
-                3. **Embedding Generation**: Each chunk is converted to a vector embedding
-                4. **Vector Storage**: Embeddings are stored in a searchable vector database
-                5. **Query Processing**: User questions are processed and relevant chunks are retrieved
-                6. **Answer Generation**: AI generates comprehensive answers based on retrieved context
-                
-                ### Technology Stack:
-                - **LangChain**: Framework for building LLM applications
-                - **OpenAI**: Language models and embeddings
-                - **FAISS**: Vector similarity search
-                - **Gradio**: Web interface
-                - **Pandas/NumPy**: Data processing
-                - **Plotly**: Interactive visualizations
-                """)
-    
-    return app
+    # Display sources
+    if st.session_state.current_chunks:
+        st.markdown("### 📚 Source Complaint Chunks")
+        # Dropdown for selecting a chunk
+        chunk_options = [f"Chunk {i+1} (Product: {chunk[1].get('product', 'N/A')}, Issue: {chunk[1].get('issue', 'N/A')})" for i,
+                         chunk in enumerate(st.session_state.current_chunks)]
+        selected_chunk = st.selectbox("Select a source chunk to view:", [
+                                      "Select a chunk"] + chunk_options)
+        if selected_chunk != "Select a chunk":
+            chunk_idx = int(selected_chunk.split(" ")[1].split(" ")[0]) - 1
+            chunk_text, chunk_metadata, chunk_score = st.session_state.current_chunks[
+                chunk_idx]
+            st.markdown(f"**Chunk Text**: {chunk_text}")
+            st.markdown(
+                f"**Metadata**: Product: {chunk_metadata.get('product', 'N/A')}, Issue: {chunk_metadata.get('issue', 'N/A')}, Date: {chunk_metadata.get('date_received', 'N/A')}, Company: {chunk_metadata.get('company', 'N/A')}, Score: {chunk_score:.3f}")
 
-if __name__ == "__main__":
-    app = create_app()
-    app.launch(
-        server_name="0.0.0.0",
-        server_port=7860,
-        share=True,
-        show_error=True
-    ) 
+        # Table of metadata
+        st.markdown("#### Source Metadata Table")
+        source_data = [
+            {
+                "Chunk": f"Chunk {i+1}",
+                "Product": chunk[1].get("product", "N/A"),
+                "Issue": chunk[1].get("issue", "N/A"),
+                "Date": chunk[1].get("date_received", "N/A"),
+                "Company": chunk[1].get("company", "N/A"),
+                "State": chunk[1].get("state", "N/A"),
+                "Tags": chunk[1].get("tags", "N/A"),
+                "Score": f"{chunk[2]:.3f}"
+            }
+            for i, chunk in enumerate(st.session_state.current_chunks)
+        ]
+        st.dataframe(pd.DataFrame(source_data), use_container_width=True)
+
+    # Instructions for troubleshooting
+    st.markdown("""
+    **Note**: If no answers are generated, ensure `src/chunking_embedding.py` has been run to populate the vector store with data from `data/filtered_complaints.csv`. Check logs for errors if issues persist.
+    """)
+
+# History tab
+with history_tab:
+    st.markdown("### 📜 Conversation History")
+    if st.session_state.conversation:
+        for i, (question, answer) in enumerate(st.session_state.conversation):
+            with st.container():
+                st.markdown(f"**Question {i+1}**: {question}")
+                st.markdown(f"**Answer**: {answer}")
+                st.markdown("---")
+    else:
+        st.markdown(
+            "No conversation history yet. Ask a question in the Query tab to start!")
