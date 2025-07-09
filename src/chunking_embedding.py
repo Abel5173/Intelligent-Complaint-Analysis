@@ -1,127 +1,134 @@
-#!/usr/bin/env python3
-"""
-Task 2: Text Chunking and Embedding Script
-
-This script handles the text chunking, embedding generation, and vector store creation
-for the CFPB complaints dataset.
-"""
-
-import pandas as pd
-import numpy as np
-from langchain.text_splitter import RecursiveCharacterTextSplitter
-from langchain.embeddings import OpenAIEmbeddings
-from langchain.vectorstores import FAISS
-import os
 import logging
-from typing import List, Dict, Any
-from tqdm import tqdm
+import os
+import torch
+import pandas as pd
+from langchain.docstore.document import Document
+from langchain.vectorstores import Chroma
+from langchain_huggingface import HuggingFaceEmbeddings
 
-# Configure logging
-logging.basicConfig(level=logging.INFO)
+# === Logging setup ===
+logging.basicConfig(level=logging.INFO,
+                    format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
 
-class ComplaintChunker:
-    """Handles text chunking for complaint narratives."""
-    
-    def __init__(self, chunk_size: int = 1000, chunk_overlap: int = 200):
-        self.chunk_size = chunk_size
-        self.chunk_overlap = chunk_overlap
-        self.text_splitter = RecursiveCharacterTextSplitter(
-            chunk_size=chunk_size,
-            chunk_overlap=chunk_overlap,
-            length_function=len,
-            separators=["\n\n", "\n", " ", ""]
-        )
-    
-    def chunk_complaints(self, complaints_df: pd.DataFrame) -> List[Dict[str, Any]]:
-        """
-        Chunk complaint narratives into smaller pieces.
-        
-        Args:
-            complaints_df: DataFrame containing complaint data
-            
-        Returns:
-            List of dictionaries containing chunked text and metadata
-        """
-        chunks = []
-        
-        for idx, row in tqdm(complaints_df.iterrows(), total=len(complaints_df), desc="Chunking complaints"):
-            narrative = row.get('Consumer complaint narrative', '')
-            if pd.isna(narrative) or narrative == '':
-                continue
-                
-            # Split the narrative into chunks
-            text_chunks = self.text_splitter.split_text(narrative)
-            
-            for chunk_idx, chunk in enumerate(text_chunks):
-                chunk_data = {
-                    'text': chunk,
-                    'complaint_id': row.get('Complaint ID', f'complaint_{idx}'),
-                    'product': row.get('Product', 'Unknown'),
-                    'issue': row.get('Issue', 'Unknown'),
-                    'company': row.get('Company', 'Unknown'),
-                    'chunk_index': chunk_idx,
-                    'total_chunks': len(text_chunks)
+# === Constants ===
+CHUNK_SIZE = 512
+CHUNK_OVERLAP = 50
+BATCH_SIZE = 256
+DATA_PATH = 'data/filtered_complaints.csv'
+VECTOR_STORE_PATH = os.path.abspath(os.path.join(
+    os.path.dirname(__file__), 'vector_store/complaint_embeddings_mini'))
+
+# === Embedding setup ===
+embedder = HuggingFaceEmbeddings(
+    model_name='thenlper/gte-small',
+    model_kwargs={'device': 'cuda' if torch.cuda.is_available() else 'cpu'}
+)
+
+# === Text chunking ===
+
+
+def chunk_text(text, chunk_size=CHUNK_SIZE, chunk_overlap=CHUNK_OVERLAP):
+    if not text or not isinstance(text, str):
+        return []
+    chunks = []
+    start = 0
+    text_length = len(text)
+    while start < text_length:
+        end = min(start + chunk_size, text_length)
+        chunks.append(text[start:end])
+        start += chunk_size - chunk_overlap
+    return chunks
+
+# === Load and clean data ===
+
+
+def load_data():
+    try:
+        df = pd.read_csv(DATA_PATH)
+        column_map = {
+            'Complaint ID': 'complaint_id',
+            'Date received': 'date_received',
+            'Product': 'product',
+            'Issue': 'issue',
+            'Company': 'company',
+            'Consumer complaint narrative': 'narrative',
+            'Sub-issue': 'sub_issue',
+            'State': 'state',
+            'Tags': 'tags',
+            'Submitted via': 'submitted_via'
+        }
+        df = df.rename(columns={k: v for k, v in column_map.items() if k in df.columns})
+        required = ['complaint_id', 'date_received', 'product', 'issue', 'company', 'narrative']
+        missing = [col for col in required if col not in df.columns]
+        if missing:
+            raise ValueError(f"Missing columns: {missing}")
+        df = df.dropna(subset=['narrative'])
+        logger.info(f"✅ Loaded {len(df)} complaints with narratives")
+        return df
+    except Exception as e:
+        logger.error(f"❌ Failed to load data: {e}")
+        raise
+
+# === Convert complaints to LangChain Documents ===
+
+
+def complaints_to_documents(df):
+    documents = []
+    for idx, row in df.iterrows():
+        try:
+            complaint_id = str(row['complaint_id'])
+            narrative = str(row['narrative'])
+            chunks = chunk_text(narrative)
+            for i, chunk in enumerate(chunks):
+                metadata = {
+                    'complaint_id': complaint_id,
+                    'chunk_index': i,
+                    'product': row.get('product', ''),
+                    'date_received': str(row.get('date_received', '')),
+                    'issue': str(row.get('issue', '')),
+                    'sub_issue': str(row.get('sub_issue', '')),
+                    'company': str(row.get('company', '')),
+                    'state': str(row.get('state', '')),
+                    'tags': str(row.get('tags', '')),
+                    'submitted_via': str(row.get('submitted_via', ''))
                 }
-                chunks.append(chunk_data)
-        
-        logger.info(f"Created {len(chunks)} chunks from {len(complaints_df)} complaints")
-        return chunks
+                doc = Document(page_content=chunk, metadata=metadata)
+                documents.append(doc)
+        except Exception as e:
+            logger.warning(f"⚠️ Skipping row due to error: {e}")
+    logger.info(f"✅ Created {len(documents)} text chunks")
+    return documents
 
-class ComplaintEmbedder:
-    """Handles embedding generation for complaint chunks."""
-    
-    def __init__(self, model_name: str = "text-embedding-ada-002"):
-        self.embeddings = OpenAIEmbeddings(model=model_name)
-    
-    def create_vector_store(self, chunks: List[Dict[str, Any]], 
-                          vector_store_path: str = "../vector_store/complaint_embeddings") -> FAISS:
-        """
-        Create and save vector store from chunks.
-        
-        Args:
-            chunks: List of chunk dictionaries
-            vector_store_path: Path to save the vector store
-            
-        Returns:
-            FAISS vector store object
-        """
-        # Extract texts and metadata
-        texts = [chunk['text'] for chunk in chunks]
-        metadatas = [{k: v for k, v in chunk.items() if k != 'text'} for chunk in chunks]
-        
-        # Create vector store
-        logger.info("Creating vector store...")
-        vector_store = FAISS.from_texts(texts, self.embeddings, metadatas=metadatas)
-        
-        # Save vector store
-        os.makedirs(vector_store_path, exist_ok=True)
-        vector_store.save_local(vector_store_path)
-        logger.info(f"Vector store saved to {vector_store_path}")
-        
-        return vector_store
+# === Build and save vector store ===
 
-def main():
-    """Main function to run the chunking and embedding pipeline."""
-    
-    # Load filtered complaints data
-    logger.info("Loading filtered complaints data...")
-    df = pd.read_csv("../data/filtered_complaints.csv")
-    logger.info(f"Loaded {len(df)} complaints")
-    
-    # Initialize chunker and embedder
-    chunker = ComplaintChunker()
-    embedder = ComplaintEmbedder()
-    
-    # Chunk the complaints
-    logger.info("Chunking complaint narratives...")
-    chunks = chunker.chunk_complaints(df)
-    
-    # Create vector store
-    logger.info("Creating vector store...")
-    vector_store = embedder.create_vector_store(chunks)
-    
-    logger.info("Chunking and embedding pipeline completed successfully!")
 
+def build_vector_store(documents):
+    try:
+        if os.path.exists(os.path.join(VECTOR_STORE_PATH, "chroma.sqlite3")):
+            logger.info("🗑️ Deleting existing vector store")
+            for file in os.listdir(VECTOR_STORE_PATH):
+                os.remove(os.path.join(VECTOR_STORE_PATH, file))
+        logger.info("🚀 Embedding and storing documents...")
+        vectorstore = Chroma.from_documents(
+            documents=documents,
+            embedding=embedder,
+            persist_directory=VECTOR_STORE_PATH
+        )
+        vectorstore.persist()
+        logger.info(f"✅ Vector store saved with {len(documents)} documents")
+        return vectorstore
+    except Exception as e:
+        logger.error(f"❌ Failed to build vector store: {e}")
+        raise
+
+
+# === Main pipeline ===
 if __name__ == "__main__":
-    main() 
+    try:
+        df = load_data()
+        df = df.sample(n=10000, random_state=42)
+        documents = complaints_to_documents(df)
+        build_vector_store(documents)
+    except Exception as e:
+        logger.error(f"🚨 Pipeline failed: {e}")
