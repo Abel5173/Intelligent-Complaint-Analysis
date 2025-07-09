@@ -1,205 +1,222 @@
-#!/usr/bin/env python3
-"""
-Task 3: RAG Pipeline Script
-
-This script implements the Retrieval-Augmented Generation (RAG) pipeline
-for intelligent complaint analysis.
-"""
-
-import pandas as pd
-import numpy as np
-from langchain.vectorstores import FAISS
-from langchain.embeddings import OpenAIEmbeddings
-from langchain.llms import OpenAI
-from langchain.chains import RetrievalQA
+from dotenv import load_dotenv
+from groq import Groq
 from langchain.prompts import PromptTemplate
-from langchain.retrievers import ContextualCompressionRetriever
-from langchain.retrievers.document_compressors import LLMChainExtractor
+from langchain_huggingface import HuggingFaceEmbeddings
+from langchain_community.vectorstores import Chroma
+import re
+import pandas as pd
+import torch
 import os
 import logging
-from typing import List, Dict, Any, Optional
-import json
 
-# Configure logging
-logging.basicConfig(level=logging.INFO)
+load_dotenv()
+
+# Set up logging
+logging.basicConfig(level=logging.INFO,
+                    format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
 
-class ComplaintRAGPipeline:
-    """RAG pipeline for complaint analysis."""
-    
-    def __init__(self, vector_store_path: str = "../vector_store/complaint_embeddings",
-                 model_name: str = "gpt-3.5-turbo"):
-        self.vector_store_path = vector_store_path
-        self.model_name = model_name
-        self.vector_store = None
-        self.llm = None
-        self.qa_chain = None
-        self._load_components()
-    
-    def _load_components(self):
-        """Load vector store and language model."""
-        try:
-            # Load vector store
-            embeddings = OpenAIEmbeddings()
-            self.vector_store = FAISS.load_local(self.vector_store_path, embeddings)
-            logger.info("Vector store loaded successfully")
-            
-            # Initialize language model
-            self.llm = OpenAI(model_name=self.model_name, temperature=0.1)
-            logger.info(f"Language model {self.model_name} initialized")
-            
-        except Exception as e:
-            logger.error(f"Error loading components: {e}")
-            raise
-    
-    def create_prompt_template(self) -> PromptTemplate:
-        """Create a custom prompt template for complaint analysis."""
-        
-        template = """You are an expert financial complaint analyst. Use the following context to answer the question about consumer financial complaints.
+# Constants
+VECTOR_STORE_PATH = os.path.abspath(os.path.join(
+    os.path.dirname(__file__), 'vector_store/complaint_embeddings_mini'))
+GROQ_API_KEY = os.getenv("GROQ_API_KEY")
 
-Context: {context}
+if not GROQ_API_KEY:
+    raise Exception("GROQ_API_KEY not set in environment variables")
+
+# Initialize embeddings
+embedder = HuggingFaceEmbeddings(
+    model_name='thenlper/gte-small',
+    model_kwargs={'device': 'cuda' if torch.cuda.is_available() else 'cpu'}
+)
+
+# Load existing vector store
+try:
+    vectorstore = Chroma(
+        embedding_function=embedder,
+        persist_directory=VECTOR_STORE_PATH
+    )
+    doc_count = vectorstore._collection.count()
+    logger.info(f"✅ Loaded vector store with {doc_count} documents")
+    if doc_count == 0:
+        logger.warning(
+            "⚠️ Vector store is empty. Please ensure the vector store is correctly populated.")
+except Exception as e:
+    logger.error(f"❌ Failed to load vector store: {e}")
+    raise
+
+# Initialize Groq client
+try:
+    groq_client = Groq(api_key=GROQ_API_KEY)
+except Exception as e:
+    logger.error(f"❌ Error initializing Groq client: {e}")
+    raise
+
+# Prompt template for Groq LLM
+system_prompt = (
+    "You are a financial complaint analyst for CreditTrust Financial. "
+    "Answer the user's question concisely using only the provided complaint excerpts and metadata. "
+    "Cite specific examples with metadata (e.g., company, date, issue) to support your answer. "
+    "Do not include reasoning steps, <think> tags, or list all chunks. "
+    "If the context lacks sufficient information, state so clearly."
+)
+
+prompt_template = """
+Context:
+{context}
 
 Question: {question}
 
-Instructions:
-1. Analyze the complaint context carefully
-2. Provide a clear, informative answer
-3. If the context doesn't contain enough information, say so
-4. Focus on the specific financial product or service mentioned
-5. Be helpful and professional in your response
+Answer:
+"""
 
-Answer:"""
-        
-        return PromptTemplate(
-            template=template,
-            input_variables=["context", "question"]
-        )
-    
-    def setup_qa_chain(self, k: int = 4) -> RetrievalQA:
-        """Set up the question-answering chain."""
-        
-        # Create retriever
-        retriever = self.vector_store.as_retriever(
-            search_type="similarity",
-            search_kwargs={"k": k}
-        )
-        
-        # Create prompt template
-        prompt = self.create_prompt_template()
-        
-        # Create QA chain
-        self.qa_chain = RetrievalQA.from_chain_type(
-            llm=self.llm,
-            chain_type="stuff",
-            retriever=retriever,
-            chain_type_kwargs={"prompt": prompt},
-            return_source_documents=True
-        )
-        
-        logger.info(f"QA chain set up with k={k} retrieved documents")
-        return self.qa_chain
-    
-    def query(self, question: str) -> Dict[str, Any]:
-        """
-        Query the RAG pipeline with a question.
-        
-        Args:
-            question: The question to ask about complaints
-            
-        Returns:
-            Dictionary containing answer and source documents
-        """
-        if self.qa_chain is None:
-            self.setup_qa_chain()
-        
-        try:
-            result = self.qa_chain({"query": question})
+prompt = PromptTemplate(
+    input_variables=["context", "question"],
+    template=prompt_template
+)
+
+bnpl_keywords = ["bnpl", "buy now pay later",
+                 "quadpay", "affirm", "afterpay", "zip"]
+
+
+def is_relevant(text):
+    return any(kw in text.lower() for kw in bnpl_keywords)
+
+
+def trim_incomplete_sentences(text):
+    sentences = re.split(r'(?<=[.!?]) +', text)
+    return ' '.join(sentences[:-1]) if not text.endswith(('.', '!', '?')) else text
+
+
+def retrieve_relevant_chunks(question, k=5):
+    try:
+        docs_and_scores = vectorstore.similarity_search_with_score(
+            question, k=k * 2)
+        chunks = [
+            (doc.page_content, doc.metadata, score)
+            for doc, score in docs_and_scores
+        ]
+        filtered_chunks = [
+            c for c in chunks if is_relevant(c[0])] or chunks[:k]
+        logger.info(
+            f"Retrieved {len(filtered_chunks)} relevant chunks for question: '{question}'")
+        return filtered_chunks[:k]
+    except Exception as e:
+        logger.error(f"Error retrieving chunks for question '{question}': {e}")
+        return []
+
+
+def rag_pipeline(question, k=5, stream=False):
+    try:
+        if vectorstore._collection.count() == 0:
             return {
-                "answer": result["result"],
-                "source_documents": result["source_documents"],
-                "question": question
+                "question": question,
+                "answer": "No relevant complaint data found in the vector store. Please populate the vector store first.",
+                "retrieved_chunks": []
             }
-        except Exception as e:
-            logger.error(f"Error querying RAG pipeline: {e}")
+
+        chunks = retrieve_relevant_chunks(question, k=k)
+        if not chunks:
             return {
-                "answer": f"Error processing query: {e}",
-                "source_documents": [],
-                "question": question
+                "question": question,
+                "answer": "No relevant complaint data found for this question.",
+                "retrieved_chunks": []
             }
-    
-    def batch_query(self, questions: List[str]) -> List[Dict[str, Any]]:
-        """
-        Process multiple questions in batch.
-        
-        Args:
-            questions: List of questions to process
-            
-        Returns:
-            List of results for each question
-        """
-        results = []
-        for question in questions:
-            result = self.query(question)
-            results.append(result)
-        return results
-    
-    def evaluate_retrieval(self, test_questions: List[str], 
-                          expected_products: List[str]) -> Dict[str, float]:
-        """
-        Evaluate retrieval performance.
-        
-        Args:
-            test_questions: List of test questions
-            expected_products: List of expected product categories
-            
-        Returns:
-            Dictionary with evaluation metrics
-        """
-        correct_retrievals = 0
-        total_questions = len(test_questions)
-        
-        for i, question in enumerate(test_questions):
-            result = self.query(question)
-            retrieved_products = set()
-            
-            # Extract products from retrieved documents
-            for doc in result["source_documents"]:
-                if hasattr(doc, 'metadata') and 'product' in doc.metadata:
-                    retrieved_products.add(doc.metadata['product'])
-            
-            # Check if expected product is in retrieved products
-            if expected_products[i] in retrieved_products:
-                correct_retrievals += 1
-        
-        accuracy = correct_retrievals / total_questions if total_questions > 0 else 0
-        
+
+        context = "\n\n".join([
+            f"(Product: {chunk[1].get('product', 'N/A')}, Issue: {chunk[1].get('issue', 'N/A')}, "
+            f"Date: {chunk[1].get('date_received', 'N/A')}, Company: {chunk[1].get('company', 'N/A')}):\n{chunk[0]}"
+            for chunk in chunks
+        ])
+        formatted_prompt = prompt.format(context=context, question=question)
+
+        if stream:
+            def stream_response():
+                for chunk in groq_client.chat.completions.create(
+                    model="deepseek-r1-distill-llama-70b",
+                    messages=[
+                        {"role": "system", "content": system_prompt},
+                        {"role": "user", "content": formatted_prompt}
+                    ],
+                    temperature=0.6,
+                    max_completion_tokens=500,
+                    top_p=0.95,
+                    stream=True
+                ):
+                    content = chunk.choices[0].delta.content or ""
+                    yield content
+            return {
+                "answer": stream_response(),
+                "retrieved_chunks": chunks
+            }
+        else:
+            completion = groq_client.chat.completions.create(
+                model="deepseek-r1-distill-llama-70b",
+                messages=[
+                    {"role": "system", "content": system_prompt},
+                    {"role": "user", "content": formatted_prompt}
+                ],
+                temperature=0.6,
+                max_completion_tokens=500,
+                top_p=0.95,
+                stream=False
+            )
+            raw_answer = completion.choices[0].message.content.strip()
+            cleaned_answer = trim_incomplete_sentences(raw_answer)
+            return {
+                "question": question,
+                "answer": cleaned_answer,
+                "retrieved_chunks": chunks
+            }
+    except Exception as e:
+        logger.error(f"Error processing question '{question}': {e}")
         return {
-            "retrieval_accuracy": accuracy,
-            "correct_retrievals": correct_retrievals,
-            "total_questions": total_questions
+            "question": question,
+            "answer": f"Error: Failed to generate answer ({str(e)})",
+            "retrieved_chunks": []
         }
 
-def main():
-    """Main function to test the RAG pipeline."""
-    
-    # Initialize RAG pipeline
-    logger.info("Initializing RAG pipeline...")
-    rag_pipeline = ComplaintRAGPipeline()
-    
-    # Test questions
-    test_questions = [
-        "What are the most common issues with credit card complaints?",
-        "How do mortgage complaints typically get resolved?",
-        "What are the main problems with student loan servicing?"
-    ]
-    
-    # Test the pipeline
-    logger.info("Testing RAG pipeline...")
-    for question in test_questions:
-        result = rag_pipeline.query(question)
-        print(f"\nQuestion: {question}")
-        print(f"Answer: {result['answer'][:200]}...")
-        print(f"Sources: {len(result['source_documents'])} documents retrieved")
 
+# Evaluation
 if __name__ == "__main__":
-    main() 
+    questions = [
+        "Why are people unhappy with BNPL?",
+        "What are common Credit card issues?",
+        "Are there Savings account complaints?",
+        "What issues arise with Money transfers?",
+        "Why do customers complain about Personal loans?",
+        "What are recent complaints in California?",
+        "Are there complaints from older consumers?",
+        "What are customer service issues with BNPL?"
+    ]
+
+    evaluation_results = []
+    for question in questions:
+        result = rag_pipeline(question)
+        top_chunks = result['retrieved_chunks'][:2]
+        evaluation_results.append({
+            "question": question,
+            "answer": result['answer'],
+            "sources": [
+                f"{chunk[0][:100]}... (Product: {chunk[1].get('product', 'N/A')}, "
+                f"Issue: {chunk[1].get('issue', 'N/A')}, Date: {chunk[1].get('date_received', 'N/A')}, "
+                f"Company: {chunk[1].get('company', 'N/A')})"
+                for chunk in top_chunks
+            ] if top_chunks else [],
+            "quality_score": 0,
+            "comments": "Pending manual evaluation"
+        })
+        print(f"\nQuestion: {question}")
+        print(f"Answer: {result['answer']}")
+        print("Top 2 Retrieved Chunks:")
+        if top_chunks:
+            for i, chunk in enumerate(top_chunks, 1):
+                print(
+                    f"Chunk {i}: {chunk[0][:100]}... (Metadata: {chunk[1]}, Score: {chunk[2]:.4f})"
+                )
+        else:
+            print("No chunks retrieved.")
+
+    pd.DataFrame(evaluation_results).to_csv(
+        'notebooks/evaluation_results.csv', index=False)
+    logger.info("✅ Evaluation results saved to notebooks/evaluation_results.csv")
